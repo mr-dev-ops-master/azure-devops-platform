@@ -57,7 +57,7 @@ jobs:
         run: terraform validate
 
       - name: Lint (TFLint + azurerm ruleset)
-        uses: terraform-linters/setup-tflint@v4
+        uses: terraform-linters/setup-tflint@v6
       - run: tflint --init && tflint --format compact
         env:
           GITHUB_TOKEN: ${{ github.token }}
