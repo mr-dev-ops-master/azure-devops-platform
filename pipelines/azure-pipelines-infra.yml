@@ -26,13 +26,11 @@ stages:
               set -e
               curl -sSLo tf.zip "https://releases.hashicorp.com/terraform/$(tfVersion)/terraform_$(tfVersion)_linux_amd64.zip"
               sudo unzip -o -q tf.zip -d /usr/local/bin
-              terraform -version
               cd terraform
               terraform fmt -check -recursive
               terraform init -backend=false -input=false
               terraform validate
             displayName: fmt + validate
-
           - bash: |
               set -e
               curl -sSLo tflint.zip "https://github.com/terraform-linters/tflint/releases/download/$(tflintVersion)/tflint_linux_amd64.zip"
@@ -42,7 +40,6 @@ stages:
               tflint --init
               tflint --format compact
             displayName: TFLint (azurerm ruleset)
-
           - bash: |
               set -e
               python3 -m pip install --quiet --user checkov
@@ -50,8 +47,51 @@ stages:
               checkov -d terraform --framework terraform --config-file terraform/.checkov.yaml \
                 --output cli --output junitxml --output-file-path console,checkov-results.xml --soft-fail
             displayName: Checkov IaC security scan
-
           - task: PublishTestResults@2
             condition: always()
             displayName: Publish Checkov results
-            inputs: {
+            inputs: { testResultsFiles: checkov-results.xml, testRunTitle: Checkov }
+          - bash: |
+              set -e
+              docker run --rm -v "$(Build.SourcesDirectory):/repo" zricethezav/gitleaks:latest \
+                detect --source /repo --no-git --no-banner --redact
+            displayName: Gitleaks secret scan
+      - job: PlanProd
+        displayName: Plan prod (preview)
+        steps:
+          - template: templates/terraform.yml
+            parameters:
+              environment: prod
+              serviceConnection: sc-azure-prod
+
+  - stage: Dev
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyDev
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/terraform.yml
+                  parameters:
+                    environment: dev
+                    serviceConnection: sc-azure-dev
+                    apply: true
+
+  - stage: Prod
+    dependsOn: Dev
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: ApplyProd
+        environment: prod          # add an Approvals check on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - template: templates/terraform.yml
+                  parameters:
+                    environment: prod
+                    serviceConnection: sc-azure-prod
+                    apply: true
