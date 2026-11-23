@@ -1,0 +1,128 @@
+# Reusable workflow: Terraform for ONE environment.
+#   apply=false -> fmt, validate, security scan, plan (pull requests)
+#   apply=true  -> plan + apply, behind the environment's approval gate
+name: _terraform (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      apply:
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  ARM_USE_OIDC: "true"
+  ARM_RESOURCE_PROVIDER_REGISTRATIONS: none
+  TF_IN_AUTOMATION: "true"
+  TF_VAR_alert_email: ${{ vars.ALERT_EMAIL }}
+  TF_VERSION: 1.9.8
+
+jobs:
+  plan:
+    name: Plan (${{ inputs.environment }})
+    if: ${{ !inputs.apply }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        run: >
+          terraform init -input=false
+          -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}"
+          -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}"
+          -backend-config="container_name=tfstate"
+          -backend-config="key=${{ inputs.environment }}.terraform.tfstate"
+          -backend-config="use_oidc=true"
+          -backend-config="use_azuread_auth=true"
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Lint (TFLint + azurerm ruleset)
+        uses: terraform-linters/setup-tflint@v4
+      - run: tflint --init && tflint --format compact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: IaC security scan (Checkov)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: terraform
+          framework: terraform
+          config_file: terraform/.checkov.yaml
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          soft_fail: true   # findings are reported in the Security tab; tighten to blocking once triaged
+
+      - name: Upload Checkov results to GitHub code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+          category: checkov-${{ inputs.environment }}
+
+      - name: Plan
+        run: terraform plan -input=false -no-color -var-file="environments/${{ inputs.environment }}.tfvars" -out tfplan
+
+      - name: Plan summary
+        run: |
+          {
+            echo "### Terraform plan - ${{ inputs.environment }}"
+            echo '```'
+            terraform show -no-color tfplan | tail -n 200
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  apply:
+    name: Apply (${{ inputs.environment }})
+    if: ${{ inputs.apply }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    concurrency: terraform-${{ inputs.environment }}
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Init
+        run: >
+          terraform init -input=false
+          -backend-config="resource_group_name=${{ vars.TF_STATE_RG }}"
+          -backend-config="storage_account_name=${{ vars.TF_STATE_SA }}"
+          -backend-config="container_name=tfstate"
+          -backend-config="key=${{ inputs.environment }}.terraform.tfstate"
+          -backend-config="use_oidc=true"
+          -backend-config="use_azuread_auth=true"
+
+      - name: Plan
+        run: terraform plan -input=false -no-color -var-file="environments/${{ inputs.environment }}.tfvars" -out tfplan
+
+      - name: Apply
+        run: terraform apply -input=false tfplan
+
+      - name: Outputs
+        run: terraform output

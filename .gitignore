@@ -1,0 +1,21 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+backend.hcl
+crash.log
+# keep .terraform.lock.hcl (pins provider versions)
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+app.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/

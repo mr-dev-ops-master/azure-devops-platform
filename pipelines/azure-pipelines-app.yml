@@ -1,0 +1,115 @@
+# Azure DevOps - Application pipeline: Build (test, Docker, scan, push) -> Dev -> Prod (slot swap)
+trigger:
+  branches: { include: [main] }
+  paths: { include: [app/*, pipelines/azure-pipelines-app.yml] }
+
+pr:
+  branches: { include: [main] }
+  paths: { include: [app/*] }
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: platform-common      # devAcrName, prodAcrName, devAppName, prodAppName, prodResourceGroup
+  - name: imageName
+    value: demo-app
+  - name: imageTag
+    value: $(Build.SourceVersion)
+
+stages:
+  - stage: Build
+    jobs:
+      - job: Build
+        steps:
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: "3.12" }
+          - bash: |
+              cd app
+              pip install -r requirements-dev.txt
+              flake8 . --max-line-length 120
+              pytest -v --junitxml=../test-results.xml
+            displayName: Lint + unit tests
+          - bash: |
+              cd app
+              bandit -r . -x ./tests -ll
+              pip-audit -r requirements.txt
+            displayName: SAST (Bandit) + dependency scan (pip-audit)
+          - bash: docker run --rm -i hadolint/hadolint hadolint --failure-threshold error - < app/Dockerfile
+            displayName: Dockerfile lint (Hadolint)
+          - task: PublishTestResults@2
+            condition: always()
+            inputs: { testResultsFiles: test-results.xml }
+          - bash: docker build --build-arg APP_VERSION=$(imageTag) -t $(imageName):$(imageTag) app
+            displayName: Docker build
+          - bash: |
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest \
+                image --severity CRITICAL --ignore-unfixed --exit-code 1 $(imageName):$(imageTag)
+            displayName: Trivy scan (fail on CRITICAL)
+          - task: AzureCLI@2
+            displayName: Push to dev ACR
+            condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+            inputs:
+              azureSubscription: sc-azure-dev
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az acr login --name $(devAcrName)
+                docker tag $(imageName):$(imageTag) $(devAcrName).azurecr.io/$(imageName):$(imageTag)
+                docker push $(devAcrName).azurecr.io/$(imageName):$(imageTag)
+
+  - stage: Dev
+    dependsOn: Build
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: DeployDev
+        environment: dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Deploy container + smoke test
+                  inputs:
+                    azureSubscription: sc-azure-dev
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -e
+                      RG=$(az webapp list --query "[?name=='$(devAppName)'].resourceGroup" -o tsv)
+                      az webapp config container set -g $RG -n $(devAppName) \
+                        --container-image-name $(devAcrName).azurecr.io/$(imageName):$(imageTag)
+                      for i in $(seq 1 20); do
+                        curl -fsS https://$(devAppName).azurewebsites.net/health && exit 0
+                        sleep 15
+                      done
+                      exit 1
+
+  - stage: Prod
+    dependsOn: Dev
+    jobs:
+      - deployment: DeployProd
+        environment: prod          # Approvals check here
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: Promote image, deploy to slot, test, swap
+                  inputs:
+                    azureSubscription: sc-azure-prod
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      set -e
+                      az acr import --name $(prodAcrName) --source $(imageName):$(imageTag) \
+                        --registry $(devAcrName) --image $(imageName):$(imageTag) --force
+                      az webapp config container set -g $(prodResourceGroup) -n $(prodAppName) --slot staging \
+                        --container-image-name $(prodAcrName).azurecr.io/$(imageName):$(imageTag)
+                      for i in $(seq 1 20); do
+                        curl -fsS https://$(prodAppName)-staging.azurewebsites.net/health && break
+                        [ $i -eq 20 ] && exit 1; sleep 15
+                      done
+                      az webapp deployment slot swap -g $(prodResourceGroup) -n $(prodAppName) \
+                        --slot staging --target-slot production
+                      curl -fsS https://$(prodAppName).azurewebsites.net/health

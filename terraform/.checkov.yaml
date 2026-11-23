@@ -1,0 +1,7 @@
+# Checkov settings.
+# Process: run the scan, triage each failed check, fix it in Terraform where possible,
+# and only skip a check here with a documented reason (reviewed in the pull request), e.g.
+#   skip-check:
+#     - CKV_AZURE_XXX   # reason: Basic ACR SKU does not support this; accepted for demo
+compact: true
+quiet: true

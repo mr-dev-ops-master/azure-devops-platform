@@ -1,0 +1,46 @@
+# Infrastructure pipeline (Terraform): dev -> prod
+#   Pull request : fmt, validate, Checkov scan and plan for dev and prod
+#   Merge to main: apply dev, then prod after approval
+name: Infra - Terraform
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/infra.yml", ".github/workflows/_terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["terraform/**", ".github/workflows/infra.yml", ".github/workflows/_terraform.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # OIDC token for Azure - no stored passwords
+  contents: read
+  security-events: write   # upload scan results to the Security tab
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    uses: ./.github/workflows/_terraform.yml
+    with:
+      environment: ${{ matrix.environment }}
+    secrets: inherit
+
+  deploy-dev:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/_terraform.yml
+    with:
+      environment: dev
+      apply: true
+    secrets: inherit
+
+  deploy-prod:
+    needs: deploy-dev
+    uses: ./.github/workflows/_terraform.yml
+    with:
+      environment: prod
+      apply: true
+    secrets: inherit

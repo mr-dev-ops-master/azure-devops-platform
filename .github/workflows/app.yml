@@ -1,0 +1,184 @@
+# Application pipeline (Docker): test -> build & scan -> dev -> prod (slot swap)
+#   Pull request : lint, unit tests, Docker build + Trivy scan (nothing deployed)
+#   Merge to main: push image to dev ACR, deploy dev, then promote the SAME image to prod
+name: App - Build & Deploy
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ["app/**", ".github/workflows/app.yml"]
+  push:
+    branches: [main]
+    paths: ["app/**", ".github/workflows/app.yml"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+
+env:
+  IMAGE_NAME: demo-app
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: flake8 . --max-line-length 120
+      - name: Unit tests
+        run: pytest -v
+
+      - name: SAST - Python security issues (Bandit)
+        run: bandit -r . -x ./tests,./.venv -ll
+
+      - name: SCA - vulnerable dependencies (pip-audit)
+        run: pip-audit -r requirements.txt
+
+  build:
+    name: Build, scan & push image
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dockerfile lint (Hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: app/Dockerfile
+          failure-threshold: error
+
+      - name: Docker build
+        run: docker build --build-arg APP_VERSION=${IMAGE_TAG::7} -t $IMAGE_NAME:$IMAGE_TAG app
+
+      - name: Vulnerability scan (Trivy) - fail on CRITICAL
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Image scan report for the Security tab (Trivy SARIF)
+        if: always()
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy.sarif
+          exit-code: "0"
+
+      - name: Upload Trivy results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Azure login (OIDC)
+        if: github.event_name != 'pull_request'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Push to dev registry
+        if: github.event_name != 'pull_request'
+        run: |
+          az acr login --name ${{ vars.DEV_ACR_NAME }}
+          IMAGE=${{ vars.DEV_ACR_NAME }}.azurecr.io/$IMAGE_NAME:$IMAGE_TAG
+          docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE
+          docker push $IMAGE
+
+  deploy-dev:
+    name: Deploy dev
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: dev
+      url: ${{ steps.deploy.outputs.webapp-url }}
+    concurrency: app-dev
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy container
+        id: deploy
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.APP_NAME }}
+          images: ${{ vars.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 20); do
+            curl -fsS "${{ steps.deploy.outputs.webapp-url }}/health" && exit 0
+            echo "waiting ($i/20)"; sleep 15
+          done
+          exit 1
+
+  deploy-prod:
+    name: Deploy prod (slot swap)
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment:
+      name: prod
+      url: https://${{ vars.APP_NAME }}.azurewebsites.net
+    concurrency: app-prod
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Promote image dev ACR -> prod ACR (same digest)
+        run: >
+          az acr import --name ${{ vars.ACR_NAME }}
+          --source $IMAGE_NAME:$IMAGE_TAG
+          --registry ${{ vars.DEV_ACR_NAME }}
+          --image $IMAGE_NAME:$IMAGE_TAG --force
+
+      - name: Deploy to staging slot
+        id: slot
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.APP_NAME }}
+          slot-name: staging
+          images: ${{ vars.ACR_NAME }}.azurecr.io/${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Smoke test staging slot
+        run: |
+          for i in $(seq 1 20); do
+            curl -fsS "${{ steps.slot.outputs.webapp-url }}/health" && exit 0
+            echo "waiting ($i/20)"; sleep 15
+          done
+          exit 1
+
+      - name: Swap staging -> production (zero downtime)
+        run: >
+          az webapp deployment slot swap
+          --resource-group ${{ vars.RESOURCE_GROUP }}
+          --name ${{ vars.APP_NAME }}
+          --slot staging --target-slot production
+
+      - name: Smoke test production
+        run: curl -fsS "https://${{ vars.APP_NAME }}.azurewebsites.net/health"
