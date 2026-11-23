@@ -90,7 +90,7 @@ jobs:
 
       - name: Azure login (OIDC)
         if: github.event_name != 'pull_request'
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -114,7 +114,7 @@ jobs:
       url: ${{ steps.deploy.outputs.webapp-url }}
     concurrency: app-dev
     steps:
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -144,7 +144,7 @@ jobs:
       url: https://${{ vars.APP_NAME }}.azurewebsites.net
     concurrency: app-prod
     steps:
-      - uses: azure/login@v2
+      - uses: azure/login@v3
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
